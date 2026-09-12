@@ -18,6 +18,7 @@ srcs += files(
   'calculator.F90',
   'external_engrad.f90',
   'calc_type.f90',
+  'calculator_libtorch.F90',
   'printouts.F90',
   'constraints.f90',
   'gfn0_api.F90',
@@ -49,3 +50,9 @@ srcs += files(
   'components/surface.F90',
   'components/solvation.F90',
 )
+
+# native MLIP direct inference: C++ TorchScript bridge (compiled only when
+# the libtorch feature is enabled; the Fortran wrapper above ships a stub)
+if with_libtorch
+  srcs += files('libtorch_bridge.cpp')
+endif

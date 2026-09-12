@@ -1,0 +1,43 @@
+# Native (in-process) MLIP inference through libtorch / TorchScript.
+#
+# This is the "libtorch" method: the model is loaded directly by the C++
+# bridge inside CREST (no Python, no fmlip-relay, no TCP socket).  When a
+# single libtorch level runs on a GPU, the singlepoint ensemble path
+# (crest_sploop) packs the whole batch into one contiguous buffer and runs
+# it through the GPU pipeline, which is what makes this attractive for
+# TTConf / large-conformer ensembles.
+#
+# Requirements:
+#   - CREST built with the libtorch feature:
+#       CMake :  -DWITH_LIBTORCH=true   (needs a discoverable Torch install)
+#       meson:  -Dlibtorch=enabled      (needs a discoverable Torch install)
+#   - a TorchScript .pt model.  For MACE-LAMMPS-format exports set
+#     model_format = "mace-lammps"; for generic
+#     forward(positions, Z) -> (energy, gradient) exports leave it "generic".
+#   - TTConf (runtype "ttconf") additionally needs a GFN0 build for the
+#     one-off Wiberg-bond-order rotor detection (WITH_GFN0, on by default).
+#
+runtype = "ttconf"
+input   = "struc.xyz"   # caffeine, C8H10N4O2
+
+[ttconf]
+preset = "normal"       # fast | normal | accurate
+sp     = true           # singlepoints only (no per-candidate geometry opt):
+                        # this is the path that feeds the GPU-batched pipeline
+                        # sp = false uses the Phase C batched optimizer driver
+                        # (automatic on GPU, one batched E+G call per iteration)
+
+[calculation]
+# libtorch_batch_opt = true   # force the batched MLIP drivers on CPU too
+                              # (GPU runs use them automatically)
+[[calculation.level]]
+method         = "libtorch"       # native MLIP direct inference (libtorch)
+model_path     = "/path/to/mace-off23-lammps.pt"   # TorchScript .pt model
+model_format   = "mace-lammps"    # "generic" | "mace-lammps"
+device         = "cuda:0"         # cpu | cuda | cuda:0 | cuda:1 | cuda:2 | cuda:3 | mps
+# cutoff        = 6.0             # neighbor-list cutoff (Angstrom), default 6.0
+# batch_size    = 0               # GPU structures per batch (0 = auto from nat)
+# ngpus         = 0               # number of GPUs (0 = auto-detect, capped at 2)
+# libtorch_aten_threads = 0               # ATen intra-op threads (0 = auto: 1 on GPU)
+# shared_model  = true            # share one model across OpenMP threads
+# libtorch_debug = false          # per-call timing printout

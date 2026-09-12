@@ -16,10 +16,17 @@
 
 set(dir "${CMAKE_CURRENT_SOURCE_DIR}")
 
+if(WITH_LIBTORCH)
+  list(APPEND srcs
+    "${dir}/libtorch_bridge.cpp"
+  )
+endif()
+
 list(APPEND srcs
   "${dir}/calculator.F90"
   "${dir}/external_engrad.f90"
   "${dir}/calc_type.f90"
+  "${dir}/calculator_libtorch.F90"
   "${dir}/printouts.F90"
   "${dir}/constraints.f90"
   "${dir}/gfn0_api.F90"

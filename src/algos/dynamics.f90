@@ -107,6 +107,9 @@ subroutine crest_moleculardynamics(env,tim)
     write (stdout,*) 'WARNING: MD run terminated ABNORMALLY'
     env%iostatus_meta = status_failed
   end if
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(calc)
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
   call tim%stop(14)
   return

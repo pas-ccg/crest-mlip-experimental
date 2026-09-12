@@ -144,6 +144,7 @@ contains !> MODULE PROCEDURES START HERE
       end do
     end if
 
+100 continue
 !>--- constrain all X-H only
     if (shk%shake_mode == 1) then
       ij = nat*(nat+1)/2
@@ -230,9 +231,11 @@ contains !> MODULE PROCEDURES START HERE
         end do
         deallocate (list)
       else
-        write (*,*) 'No bonding information provided!'
-        write (*,*) 'Automatic SHAKE setup failed.'
-        error stop
+        write (*,*) 'No bonding information (WBO) available.'
+        write (*,*) 'MLIP calculators provide only energy+gradient, not WBOs.'
+        write (*,*) 'Falling back to SHAKE mode 1 (X-H bonds only).'
+        shk%shake_mode = 1
+        goto 100
       end if
     end if
 

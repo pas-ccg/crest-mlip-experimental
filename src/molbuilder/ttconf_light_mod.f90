@@ -1068,6 +1068,9 @@ contains
           &     combis(:,1:ncand),ncand,Aref,energies(1:ncand),rawunit,nadd,cache)
 
           ntot = ntot+nadd
+          write (stdout,'(1x,"║ ",a,i0,a)') '   >> raw survivors so far: ', &
+            ntot,'  (block done)'
+          flush (stdout)
           nr = rL*ng; nc = rR
           allocate (Amat(nr,nc),source=0.0_wp)
           emin = ttl_einf
@@ -1118,6 +1121,9 @@ contains
           call ttconf_eval_batch(env,mol,molc,zrow2site,site_ngrid,site_step,nsite, &
           &     combis(:,1:ncand),ncand,Aref,energies(1:ncand),rawunit,nadd,cache)
           ntot = ntot+nadd
+          write (stdout,'(1x,"║ ",a,i0,a)') '   >> raw survivors so far: ', &
+            ntot,'  (block done)'
+          flush (stdout)
           nr = ng*rR; nc = rL
           allocate (Amat(nr,nc),source=0.0_wp)
           emin = ttl_einf
@@ -1155,6 +1161,7 @@ contains
     else
       write (stdout,'(3x,a)') 'disabled (every candidate re-optimized)'
     end if
+    flush (stdout)
     call cache%destroy()
 
     deallocate (Lfull,Rfull,Lnew,Rnew,rhoL,rhoR,combis,rrow,rcol,isel,energies)

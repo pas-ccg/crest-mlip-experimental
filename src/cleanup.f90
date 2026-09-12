@@ -56,6 +56,8 @@ end subroutine rmrfw
 subroutine custom_cleanup(env)
    use crest_data
    use iomod
+   use crest_calculator, only: mlip_cleanup_all
+   use calc_libtorch, only: libtorch_shared_cleanup
    implicit none
    type(systemdata) :: env
    integer :: i
@@ -79,6 +81,11 @@ subroutine custom_cleanup(env)
    endif
    call rmrf('.CHRG .UHF')
    call rmrf('.history.xyz')
+   !> Final MLIP cleanup: force-release all in-process model handles even if
+   !> mlip_keep_loaded was set (we are exiting the program now).
+   env%calc%mlip_keep_loaded = .false.
+   call mlip_cleanup_all(env%calc)
+   call libtorch_shared_cleanup()
 end subroutine custom_cleanup
 
 

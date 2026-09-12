@@ -31,6 +31,7 @@ module crest_calculator
   use constraints
   use nonadiabatic_module
   use lwoniom_module
+  use calc_libtorch !> native MLIP direct inference (libtorch/TorchScript)
 !$ use omp_lib
   implicit none
 !=========================================================================================!
@@ -44,6 +45,23 @@ module crest_calculator
   public :: jobtype               !> calculation type ID's
   public :: engrad_interface      !> abstract interface for host-supplied potentials
   public :: get_dipoles
+!>--- RE-EXPORT of native MLIP (libtorch) routines
+  public :: libtorch_engrad
+  public :: libtorch_init
+  public :: libtorch_init_shared
+  public :: libtorch_cleanup
+  public :: libtorch_set_threads
+  public :: libtorch_shared_cleanup
+  public :: libtorch_engrad_batch_f
+  public :: libtorch_engrad_batch_pipeline_f
+  public :: libtorch_engrad_batch_multigpu_f
+  public :: libtorch_load_shared_on_device_f
+  public :: libtorch_get_cuda_device_count_f
+  public :: libtorch_get_gpu_memory_f
+!>--- MLIP housekeeping helpers (in-process backends)
+  public :: mlip_cleanup_all
+  public :: mlip_needs_shared_model
+  public :: mlip_auto_batch_size
 !>--- RE-EXPORT of constraints
   public :: constraint
   public :: scantype
@@ -435,6 +453,10 @@ contains  !> MODULE PROCEDURES START HERE
 
     case (jobtype%mlip)
       call mlip_engrad(molptr,calc%calcs(id),calc%etmp(id),calc%grdtmp(:,1:pnat,id),iostatus)
+
+    case (jobtype%libtorch)
+      !> native MLIP direct inference via libtorch (in-process C++/TorchScript)
+      call libtorch_engrad(molptr,calc%calcs(id),calc%etmp(id),calc%grdtmp(:,1:pnat,id),iostatus)
 
     case (jobtype%solvation)
       call solvation_engrad(molptr,calc%calcs(id),calc%etmp(id),calc%grdtmp(:,1:pnat,id),iostatus)
@@ -953,6 +975,74 @@ contains  !> MODULE PROCEDURES START HERE
     gradient(:,:) = self%calc%grdtmp(:,1:nat,i)
   end subroutine crest_oniom_engrad
 #endif
+
+!==========================================================================================!
+!> MLIP housekeeping for the in-process backends (libtorch).
+!> The fmlip-relay socket backend (jobtype%mlip) manages its server
+!> processes separately (mlip_sc); here we only release in-process model
+!> handles that live inside the calculation_settings objects.
+!> Idempotent: safe to call even if no MLIP backend was initialized.
+!==========================================================================================!
+
+  subroutine mlip_cleanup_all(calc)
+!*******************************************************************
+!* Clean up all in-process MLIP backends (currently: libtorch) for
+!* every calculation level in the given calcdata object.
+!* Called at the end of each algorithm entry point so GPU models are
+!* released. If calc%mlip_keep_loaded is true the handles are kept
+!* alive so the model can be reused across workflow steps (e.g.
+!* repeated TTConf batches); the model is then released at program
+!* exit (see graceful_shutdowns).
+!*******************************************************************
+    implicit none
+    type(calcdata), intent(inout) :: calc
+    integer :: j
+    if (calc%mlip_keep_loaded) return
+    do j = 1, calc%ncalculations
+      if (calc%calcs(j)%id == jobtype%libtorch) call libtorch_cleanup(calc%calcs(j))
+    end do
+  end subroutine mlip_cleanup_all
+
+!==========================================================================================!
+
+  function mlip_needs_shared_model(calc) result(needs)
+!*******************************************************************
+!* True if any calculation level requires a single shared libtorch
+!* model for GPU batched inference (the GPU-batched sploop fast path
+!* and the per-thread GPU fallback both serialize on the C++ mutex,
+!* so sharing one model is the only sensible configuration).
+!*******************************************************************
+    implicit none
+    type(calcdata), intent(in) :: calc
+    logical :: needs
+    integer :: j
+    needs = .false.
+    do j = 1, calc%ncalculations
+      if (calc%calcs(j)%id == jobtype%libtorch .and. &
+          calc%calcs(j)%libtorch_device_id > 0) needs = .true.
+    end do
+  end function mlip_needs_shared_model
+
+!==========================================================================================!
+
+  function mlip_auto_batch_size(nat) result(bsz)
+!*******************************************************************
+!* Auto-tune GPU batch size based on atom count.
+!*   nat < 30   -> 64  (small molecules, GPU can handle many)
+!*   nat < 100  -> 16  (medium, balance memory vs throughput)
+!*   nat >= 100 -> 4   (large, conserve GPU memory)
+!*******************************************************************
+    implicit none
+    integer, intent(in) :: nat
+    integer :: bsz
+    if (nat < 30) then
+      bsz = 64
+    else if (nat < 100) then
+      bsz = 16
+    else
+      bsz = 4
+    end if
+  end function mlip_auto_batch_size
 
 !==========================================================================================!
 !==========================================================================================!

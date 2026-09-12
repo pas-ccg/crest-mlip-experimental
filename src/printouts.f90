@@ -936,6 +936,7 @@ subroutine print_crest_metadata()
   write (*,'(2x,a,t22,":   ",a)') '-DWITH_LIBPVOL   ',libpvolvar
   write (*,'(2x,a,t22,":   ",a)') '-DWITH_LWONIOM   ',lwoniomvar
   write (*,'(2x,a,t22,":   ",a)') '-DWITH_FMLIP_RELAY',fmliprelayvar
+  write (*,'(2x,a,t22,":   ",a)') '-DWITH_LIBTORCH  ',libtorchvar
 end subroutine print_crest_metadata
 
 subroutine cat_mod(ch,pre,fname,post)

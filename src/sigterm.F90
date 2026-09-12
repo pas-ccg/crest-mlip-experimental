@@ -143,8 +143,11 @@ end subroutine creststop
 !=============================================================!
   subroutine graceful_shutdowns()
     use mlip_sc
+    use calc_libtorch
     implicit none
     call mlips_shutdown()
+    !> release any in-process libtorch models still held
+    call libtorch_shared_cleanup()
   end subroutine graceful_shutdowns
 !&<
 

@@ -122,6 +122,8 @@ subroutine crest_singlepoint(env,tim)
   end if
 
   deallocate (grad)
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
   return
 end subroutine crest_singlepoint

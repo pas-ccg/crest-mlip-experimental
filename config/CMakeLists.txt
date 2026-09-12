@@ -38,6 +38,7 @@ option(WITH_GFNFF   "Enable support for GFN-FF"   TRUE)
 option(WITH_LIBPVOL "Enable support for LIBPVOL"  TRUE)
 option(WITH_LWONIOM "Enable support for lwONIOM"  TRUE)
 option(WITH_FMLIP_RELAY "Enable fmlip-relay interface"  TRUE) 
+option(WITH_LIBTORCH  "Enable direct libtorch MLIP inference" FALSE)
 option(WITH_TESTS   "Enable unit tests"           TRUE)
 
 option(STATICBUILD  "Attempt to link everything statically" FALSE) 
@@ -108,6 +109,7 @@ set(ddxvar "${WITH_TBLITE}")
 set(libpvolvar "${WITH_LIBPVOL}")
 set(lwoniomvar "${WITH_LWONIOM}")
 set(fmliprelayvar "${WITH_FMLIP_RELAY}")
+set(libtorchvar "${WITH_LIBTORCH}")
 
 configure_file(
   "${PROJECT_SOURCE_DIR}/assets/template/metadata.f90"

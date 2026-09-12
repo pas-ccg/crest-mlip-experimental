@@ -171,6 +171,8 @@ subroutine crest_optimization(env,tim)
     call deform_opt_hess(calc,molnew) !> run the hessian reconstruction
   end if
 
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
 
   return
@@ -268,6 +270,8 @@ subroutine crest_ensemble_optimization(env,tim)
   end if
 
 !========================================================================================!
+  !>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(env%calc)
   call tim%stop(14)
   return
 end subroutine crest_ensemble_optimization

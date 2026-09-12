@@ -19,6 +19,7 @@
 
 module calc_type
   use iso_fortran_env,only:wp => real64,stdout => output_unit
+  use iso_c_binding,only:c_ptr,c_null_ptr
   use crest_external_engrad,only:engrad_interface
   use constraints
   use strucrd,only:coord
@@ -62,10 +63,11 @@ module calc_type
     integer :: solvation = 15
     integer :: electrostatic = 16
     integer :: external  = 17
+    integer :: libtorch  = 18   !> native MLIP inference via libtorch (in-process C++)
   end type enum_jobtype
   type(enum_jobtype), parameter,public :: jobtype = enum_jobtype()
 
-  character(len=45),parameter,private :: jobdescription(18) = [character(len=45) :: &
+  character(len=45),parameter,private :: jobdescription(19) = [character(len=45) :: &
      & 'Unknown calculation type                    ', &
      & 'xTB calculation via external binary         ', &
      & 'Generic script execution                    ', &
@@ -83,7 +85,8 @@ module calc_type
      & 'MLIP via persistent python socket           ', &
      & 'Standalone implicit solvation contribution  ', &
      & 'Charge-equilibration electrostatics         ', &
-     & 'Externally supplied potential (host callback)']
+     & 'Externally supplied potential (host callback)', &
+     & 'MLIP direct inference via libtorch          ']
 !&>
 
 !=========================================================================================!
@@ -226,8 +229,42 @@ module calc_type
 !>--- ORCA job template
     type(orca_input) :: ORCA
 
-!>--- MLIP settings
+!>--- MLIP settings (fmlip-relay socket backend)
     type(mlip_params) :: MPAR
+
+!>=========================================================================
+!> Native MLIP direct-inference settings (libtorch / TorchScript backend)
+!> In-process C++ inference — no Python, no TCP socket. This is the
+!> "libtorch" method (jobtype%libtorch), in contrast to %MPAR which drives
+!> the fmlip-relay persistent-python-socket backend (jobtype%mlip).
+!>
+!> Lazy initialization: the model is loaded on the first engrad() call
+!> (libtorch_init), or eagerly via libtorch_init_shared() when the
+!> GPU-batched singlepoint path is used (one shared handle, broadcast to
+!> all OpenMP threads). Handles are opaque C++ pointers (LibtorchContext*)
+!> owned by libtorch_bridge.cpp; release them with libtorch_cleanup().
+!> Thread safety: each OpenMP thread gets its own calc copy with its own
+!> handle. In GPU mode the batched path shares a single model (forward
+!> passes serialized by a C++ mutex).
+!>=========================================================================
+    type(c_ptr) :: libtorch_handle = c_null_ptr   !> opaque C++ model context
+    character(len=:),allocatable :: libtorch_model_path  !> path to TorchScript .pt
+    integer :: libtorch_device_id = 0     !> 0=CPU, 1=CUDA:0, 2=MPS, 10-13=CUDA:0-3
+    integer :: libtorch_model_format = 0  !> 0=generic (tuple output), 1=MACE-LAMMPS (dict)
+    real(wp) :: libtorch_cutoff = 6.0_wp  !> neighbor list cutoff (Angstrom)
+    logical :: libtorch_debug = .false.   !> print per-call timing
+    integer :: libtorch_call_count = 0    !> running counter for debug output
+    real(wp) :: libtorch_total_time = 0.0_wp  !> cumulative wall time (seconds)
+    logical :: libtorch_is_shared = .false.   !> handle comes from the shared registry
+
+!>--- GPU parallelization settings for the native MLIP backend (shared with
+!>    the fmlip-relay backend where meaningful)
+    logical :: libtorch_shared_model = .false.  !> share one model across OMP threads
+    logical :: mlip_keep_loaded = .false.  !> keep MLIP model loaded across workflow steps
+    logical :: mlip_batch_opt = .false.    !> force the batched native-MLIP driver (even on CPU)
+    integer :: mlip_batch_size = 0      !> structures per GPU batch (0=auto from nat)
+    integer :: mlip_aten_threads = 0    !> ATen intra-op threads (0=auto: T for CPU, 1 for GPU)
+    integer :: mlip_ngpus = 0           !> GPUs for multi-GPU batching (0=auto-detect, cap 2)
 
 !>--- externally supplied potential (host-program callback)
 !>    native Fortran procedure pointer + unlimited polymorphic context
@@ -316,6 +353,17 @@ module calc_type
     integer  :: lbfgs_histsize = 20  !> L-BFGS history size
     integer  :: hess_init = 5 !> Initialization of the hessian, standard modhess lindh95
     logical  :: logextxyz = .true.  !> write extended xyz files from optimization trajectories
+
+!>--- MLIP model persistence: when true, mlip_cleanup_all() skips freeing
+!>    model handles, allowing the model (e.g. a libtorch GPU model) to be
+!>    reused across workflow steps / repeated parallel-loop calls.
+    logical :: mlip_keep_loaded = .false.
+
+!>--- MLIP batched driver: when true, the native MLIP (libtorch) levels use
+!>    the batched parallel-loop drivers (one batched E+G call per iteration
+!>    for all structures) even on CPU. On GPU devices the batched drivers
+!>    are always used automatically.
+    logical :: mlip_batch_opt = .false.
 
 !>--- GFN0* data, needed for special MECP application
     type(gfn0_data),allocatable  :: g0calc
@@ -417,6 +465,8 @@ contains  !>--- Module routines start here
     self%tsopt = .false.
     self%iupdat = 0  !> 0=BFGS, 1=Powell, 2=SR1, 3=Bofill, 4=Schlegel
     self%opt_engine = 0 !> default: ANCOPT
+    self%mlip_keep_loaded = .false.
+    self%mlip_batch_opt = .false.
 
     self%pr_energies = .false.
     self%eout_unit = stdout
@@ -529,6 +579,12 @@ contains  !>--- Module routines start here
       call move_alloc(callist,self%calcs)
       self%ncalculations = i
     end if
+
+    !> propagate the "keep the MLIP model loaded" request from any level to
+    !> the container: the algorithm-level cleanups (mlip_cleanup_all,
+    !> crest_sploop) only see the calcdata flag, not the per-level one
+    self%mlip_keep_loaded = self%mlip_keep_loaded .or. cal%mlip_keep_loaded
+    self%mlip_batch_opt   = self%mlip_batch_opt   .or. cal%mlip_batch_opt
 
     return
   end subroutine calculation_add_settings
@@ -805,6 +861,8 @@ contains  !>--- Module routines start here
     self%lbfgs_histsize = src%lbfgs_histsize
     self%hess_init      = src%hess_init
     self%logextxyz      = src%logextxyz
+    self%mlip_keep_loaded = src%mlip_keep_loaded
+    self%mlip_batch_opt   = src%mlip_batch_opt
 
 ! ── smooth-function parameters ───────────────────────────────────────────────
     self%L       = src%L
@@ -1228,6 +1286,24 @@ contains  !>--- Module routines start here
     if (allocated(self%ff_dat)) deallocate (self%ff_dat)
     if (allocated(self%gff_fragments)) deallocate (self%gff_fragments)
     if (allocated(self%libpvol)) deallocate (self%libpvol)
+    if (allocated(self%libtorch_model_path)) deallocate (self%libtorch_model_path)
+
+    !> native MLIP (libtorch): drop the handle reference (the model object
+    !> itself is released by the algorithm-level cleanup, mlip_cleanup_all)
+    self%libtorch_handle = c_null_ptr
+    self%libtorch_is_shared = .false.
+    self%libtorch_device_id = 0
+    self%libtorch_model_format = 0
+    self%libtorch_cutoff = 6.0_wp
+    self%libtorch_debug = .false.
+    self%libtorch_call_count = 0
+    self%libtorch_total_time = 0.0_wp
+    self%libtorch_shared_model = .false.
+    self%mlip_keep_loaded = .false.
+    self%mlip_batch_opt = .false.
+    self%mlip_batch_size = 0
+    self%mlip_aten_threads = 0
+    self%mlip_ngpus = 0
 
     !> external callback: drop the references (we do not own the targets)
     self%ext_engrad => null()
@@ -1372,9 +1448,31 @@ contains  !>--- Module routines start here
     self%ag      = src%ag
     self%penalty = src%penalty
 
-! ── MLIP settings ────────────────────────────────────────────────────────────
+! ── MLIP settings (fmlip-relay socket backend) ───────────────────────────────
     self%MPAR     = src%MPAR
     self%MPAR%iid = 0  !> reset instance ID for parallelization
+
+! ── native MLIP (libtorch) settings ──────────────────────────────────────────
+!> Copy the scalar/char settings. The opaque C++ model handle is NOT copied:
+!> it is C-level state owned by the source instance. Each fresh copy re-
+!> initialises lazily on first engrad(), or the parallel driver explicitly
+!> broadcasts a shared handle (see crest_sploop).
+    if (allocated(src%libtorch_model_path)) &
+    &  self%libtorch_model_path = src%libtorch_model_path
+    self%libtorch_handle       = c_null_ptr
+    self%libtorch_is_shared    = .false.
+    self%libtorch_device_id    = src%libtorch_device_id
+    self%libtorch_model_format = src%libtorch_model_format
+    self%libtorch_cutoff       = src%libtorch_cutoff
+    self%libtorch_debug        = src%libtorch_debug
+    self%libtorch_call_count   = 0
+    self%libtorch_total_time   = 0.0_wp
+    self%libtorch_shared_model = src%libtorch_shared_model
+    self%mlip_keep_loaded      = src%mlip_keep_loaded
+    self%mlip_batch_opt        = src%mlip_batch_opt
+    self%mlip_batch_size       = src%mlip_batch_size
+    self%mlip_aten_threads     = src%mlip_aten_threads
+    self%mlip_ngpus            = src%mlip_ngpus
 
 ! ── external callback ─────────────────────────────────────────────────────────
 !>  Pointer-copy the host callback and its context: both copies refer to the
@@ -1570,6 +1668,12 @@ contains  !>--- Module routines start here
       end if
     case (jobtype%external)
       self%shortflag = 'external (host callback)'
+    case (jobtype%libtorch)
+      if (self%libtorch_model_format == 1) then
+        self%shortflag = 'MLIP/MACE (libtorch)'
+      else
+        self%shortflag = 'MLIP (libtorch)'
+      end if
     case default
       self%shortflag = 'undefined'
     end select
@@ -1779,6 +1883,48 @@ contains  !>--- Module routines start here
       end if
     end if
 
+    !> native MLIP (libtorch direct-inference) details
+    if (self%id == jobtype%libtorch) then
+      write (iunit,fmt4) 'Native MLIP direct inference (libtorch / TorchScript)'
+      if (self%libtorch_model_format == 1) then
+        write (iunit,fmt4) 'MACE-LAMMPS TorchScript model'
+      else
+        write (iunit,fmt4) 'Generic TorchScript model (tuple output)'
+      end if
+      write (atmp,*) 'Model file'
+      if (allocated(self%libtorch_model_path)) then
+        write (iunit,fmt3) atmp,trim(self%libtorch_model_path)
+      else
+        write (iunit,fmt3) atmp,'<not set>'
+      end if
+      write (atmp,*) 'Compute device'
+      select case (self%libtorch_device_id)
+      case (0);   write (iunit,fmt3) atmp,'cpu'
+      case (1);   write (iunit,fmt3) atmp,'cuda:0'
+      case (2);   write (iunit,fmt3) atmp,'mps'
+      case (10);  write (iunit,fmt3) atmp,'cuda:0'
+      case (11);  write (iunit,fmt3) atmp,'cuda:1'
+      case (12);  write (iunit,fmt3) atmp,'cuda:2'
+      case (13);  write (iunit,fmt3) atmp,'cuda:3'
+      case default
+        write (iunit,fmt1) atmp,self%libtorch_device_id
+      end select
+      write (atmp,*) 'Neighbor cutoff [A]'
+      write (iunit,fmt2) atmp,self%libtorch_cutoff
+      if (self%mlip_batch_size > 0) then
+        write (atmp,*) 'GPU batch size'
+        write (iunit,fmt1) atmp,self%mlip_batch_size
+      end if
+      if (self%mlip_ngpus > 0) then
+        write (atmp,*) 'Number of GPUs'
+        write (iunit,fmt1) atmp,self%mlip_ngpus
+      end if
+      if (self%mlip_aten_threads > 0) then
+        write (atmp,*) 'ATen threads'
+        write (iunit,fmt1) atmp,self%mlip_aten_threads
+      end if
+    end if
+
     if (any((/jobtype%orca,jobtype%xtbsys,jobtype%turbomole, &
     &  jobtype%generic,jobtype%terachem/) == self%id)) then
       if (index(self%binary,'gxtb') .ne. 0) then
@@ -1953,6 +2099,11 @@ contains  !>--- Module routines start here
     case ('external','--external')
       !> the host program must still register its callback via %set_external
       self%id = jobtype%external
+
+    case ('libtorch','--libtorch','mace-direct','mace_direct')
+      !> native MLIP direct inference via libtorch (in-process C++/TorchScript);
+      !> the host program must still set libtorch_model_path
+      self%id = jobtype%libtorch
 
     end select
 

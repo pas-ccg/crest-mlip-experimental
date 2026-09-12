@@ -198,6 +198,15 @@ subroutine trialMD_calculator(env)
   rtime = profiler%get(counter)
   call timeestimate(rtime,env%mdtime,env%nmetadyn,env%threads)
 
+!>--- release in-process MLIP model handles (libtorch), if any
+  if (allocated(calcstart)) then
+    do ii = 1,size(calcstart)
+      call mlip_cleanup_all(calcstart(ii))
+    end do
+  end if
+  call mlip_cleanup_all(tmpcalc)
+  call mlip_cleanup_all(env%calc)
+
   return
 !=========================================================================================!
 contains
@@ -328,6 +337,10 @@ subroutine trialOPT_calculator(env)
   env%ref%at = molopt%at
   env%ref%xyz = molopt%xyz
   env%ref%etot = energy
+
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(tmpcalc)
+  call mlip_cleanup_all(env%calc)
 
   deallocate (grd)
 end subroutine trialOPT_calculator

@@ -295,6 +295,9 @@ subroutine crest_numhess(env,tim)
   if (allocated(freq)) deallocate (freq)
   if (allocated(ohess)) deallocate (ohess)
   if (allocated(ofreq)) deallocate (ofreq)
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(calc)
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
   call tim%stop(15)
 
@@ -568,6 +571,8 @@ subroutine crest_ensemble_hessians(env,tim)
   write (stdout,'(/,a,a,a)') 'List of free energies written to <','crest.energies','>'
 
   deallocate (eread,at,xyz)
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
   call tim%stop(14)
   return

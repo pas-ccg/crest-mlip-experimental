@@ -92,6 +92,11 @@ option('fmlip-relay',
   value   : 'auto',
   description : 'Enable fmlip-relay ML/IP interface',
 )
+option('libtorch',
+  type    : 'feature',
+  value   : 'disabled',
+  description : 'Enable native MLIP direct inference via libtorch (TorchScript, in-process C++)',
+)
 
 # ── Developer options ──────────────────────────────────────────────────────────
 option('tests',

@@ -228,6 +228,9 @@ contains !> MODULE PROCEDURES START HERE
       end if
       allocate (job%efield(3),source=0.0_wp)
       job%efield(:) = kv%value_fa(:)
+    case ('cutoff','libtorch_cutoff')
+      !> neighbor list cutoff for the libtorch backend (Angstrom)
+      job%libtorch_cutoff = kv%value_f
 
 !>--- integers
     case ('uhf')
@@ -251,6 +254,14 @@ contains !> MODULE PROCEDURES START HERE
       job%MPAR%TIMEOUT_SEC = kv%value_i
     case ('config')
       call job%addconfig(kv%value_ia)
+    case ('libtorch_device_id')
+      job%libtorch_device_id = kv%value_i
+    case ('libtorch_batch_size')
+      job%mlip_batch_size = kv%value_i
+    case ('libtorch_aten_threads')
+      job%mlip_aten_threads = kv%value_i
+    case ('libtorch_ngpus')
+      job%mlip_ngpus = kv%value_i
 
 !>--- strings
     case ('method')
@@ -313,6 +324,10 @@ contains !> MODULE PROCEDURES START HERE
         nullify (job%penalty%biaslist)
       case ('mlip','fmlip_relay')
         job%id = jobtype%mlip
+      case ('libtorch','mace-direct','mace_direct')
+        !> native MLIP direct inference via libtorch (in-process C++/TorchScript,
+        !> no Python, no socket)
+        job%id = jobtype%libtorch
       case ('solvation','solvator')
         job%id = jobtype%solvation
         if (.not.allocated(job%solv)) allocate (job%solv)
@@ -420,6 +435,43 @@ contains !> MODULE PROCEDURES START HERE
 
     case ('mlip_uma_task','mlip_umatask')
       job%MPAR%umatask = kv%value_c
+
+!>--- native MLIP (libtorch) model / device selection
+    case ('model_path','libtorch_model','libtorch_modelpath')
+      !> path to the TorchScript .pt model (exported via scripts/export_model.py
+      !> in the crest-mlip distribution)
+      job%libtorch_model_path = kv%value_c
+    case ('device','libtorch_device')
+      !> compute device. Device codes: 0=CPU, 1=CUDA:0, 2=MPS, 10-13=CUDA:0-3
+      select case (kv%value_c)
+      case ('cpu','CPU')
+        job%libtorch_device_id = 0
+      case ('cuda','CUDA','gpu','GPU')
+        job%libtorch_device_id = 1
+      case ('cuda:0')
+        job%libtorch_device_id = 10
+      case ('cuda:1')
+        job%libtorch_device_id = 11
+      case ('cuda:2')
+        job%libtorch_device_id = 12
+      case ('cuda:3')
+        job%libtorch_device_id = 13
+      case ('mps','MPS')
+        job%libtorch_device_id = 2
+      case default
+        write (stdout,fmtura) kv%value_c
+        call creststop(status_config)
+      end select
+    case ('model_format','libtorch_format')
+      select case (kv%value_c)
+      case ('generic')
+        job%libtorch_model_format = 0
+      case ('mace-lammps','mace_lammps','lammps')
+        job%libtorch_model_format = 1
+      case default
+        write (stdout,fmtura) kv%value_c
+        call creststop(status_config)
+      end select
 
     case ('orca_cmd')
       job%id = jobtype%orca
@@ -611,6 +663,14 @@ contains !> MODULE PROCEDURES START HERE
       job%ceh_guess = kv%value_b
     case ('spin_polarized')
       job%spin_polarized = kv%value_b
+    case ('shared_model','libtorch_shared_model')
+      job%libtorch_shared_model = kv%value_b
+    case ('libtorch_debug')
+      job%libtorch_debug = kv%value_b
+    case ('mlip_keep_loaded')
+      job%mlip_keep_loaded = kv%value_b
+    case ('libtorch_batch_opt','mlip_batch_opt')
+      job%mlip_batch_opt = kv%value_b
 
     case default
       !>--- keyword not correctly read/found
@@ -664,6 +724,12 @@ contains !> MODULE PROCEDURES START HERE
 
     case ('maxerise')
       calc%maxerise = kv%value_f !> optimization max E rise (Ha)
+
+    case ('libtorch_batch_opt','mlip_batch_opt')
+      calc%mlip_batch_opt = kv%value_b !> force the batched native-MLIP driver (even on CPU)
+
+    case ('mlip_keep_loaded')
+      calc%mlip_keep_loaded = kv%value_b !> keep the MLIP model loaded across workflow steps
 
     case ('displ_opt','maxdispl')
       calc%maxdispl_opt = kv%value_f !> optimization step size/scaling

@@ -150,7 +150,7 @@ contains  !> MODULE PROCEDURES START HERE
     do
       read (ich,*,iostat=io) dum
       if (io < 0) exit
-      if (io > 0) cycle
+      if (io > 0) exit  !> not a frame count (truncated/corrupt ensemble) → stop counting
       if (nat == 0) natref = dum
       read (ich,*,iostat=io)
       if (io < 0) exit

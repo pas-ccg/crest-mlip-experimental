@@ -89,6 +89,10 @@ subroutine crest_scan(env,tim)
   !close(calcclean%eout_unit) 
 
   deallocate (grad)
+!>--- release in-process MLIP model handles (libtorch), if any
+  call mlip_cleanup_all(calc)
+  call mlip_cleanup_all(calcclean)
+  call mlip_cleanup_all(env%calc)
 !========================================================================================!
   call tim%stop(14)
   return

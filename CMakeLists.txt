@@ -85,6 +85,59 @@ if(LAPACK_LIBRARIES OR BLAS_LIBRARIES)
   endif()
 endif()
 
+# Static builds: CMake reorders raw linker flags (e.g. the -Wl,--start-group /
+# -Wl,--end-group that FindBLAS emits for static Intel MKL) away from the
+# libraries they are meant to wrap, which breaks single-pass archive
+# resolution of MKL's circular intra-library references.  Replace the
+# flagged list with a plain doubled .a list (standard workaround for
+# circular archive dependencies) and sync the imported targets.
+if(STATICBUILD)
+  set(_static_mkl_libs "")
+  foreach(_lib IN LISTS BLAS_LIBRARIES)
+    if(_lib MATCHES "\\.a$")
+      list(APPEND _static_mkl_libs "${_lib}")
+    endif()
+  endforeach()
+  if(NOT _static_mkl_libs)
+    foreach(_lib IN LISTS LAPACK_LIBRARIES)
+      if(_lib MATCHES "\\.a$")
+        list(APPEND _static_mkl_libs "${_lib}")
+      endif()
+    endforeach()
+  endif()
+  if(_static_mkl_libs)
+    list(REMOVE_DUPLICATES _static_mkl_libs)
+    # Preferred: a single combined archive (gf+thread+core+gomp merged, see
+    # /workspace/mklstatic/build_combined.sh).  One archive is resolved by the
+    # linker to a fixpoint, which sidesteps BOTH problems at once:
+    #   1) MKL's circular inter-archive references (gf -> thread -> core ->
+    #      thread) that need the list repeated (verified: 2 passes leave
+    #      mkl_trans_mkl_domatcopy2_par undefined, 3 link clean);
+    #   2) CMake link-line dedup, which collapses a repeated list back down
+    #      for subproject targets that reference the plain BLAS_LIBRARIES
+    #      variable (e.g. ddx), reintroducing the single-pass failure.
+    if(NOT STATIC_MKL_ARCHIVE)
+      set(STATIC_MKL_ARCHIVE "/workspace/mklstatic/libmkl_all.a")
+    endif()
+    if(EXISTS "${STATIC_MKL_ARCHIVE}")
+      set(BLAS_LIBRARIES "${STATIC_MKL_ARCHIVE}")
+      set(LAPACK_LIBRARIES "${STATIC_MKL_ARCHIVE}")
+      message(STATUS "Static BLAS/LAPACK: single combined archive ${STATIC_MKL_ARCHIVE}")
+    else()
+      # Fallback: tripled list (MKL circular ref chains are 3 archives deep).
+      set(BLAS_LIBRARIES "${_static_mkl_libs};${_static_mkl_libs};${_static_mkl_libs}")
+      set(LAPACK_LIBRARIES "${_static_mkl_libs};${_static_mkl_libs};${_static_mkl_libs}")
+      message(STATUS "Static BLAS/LAPACK archive list (tripled for circular deps): ${_static_mkl_libs}")
+    endif()
+    if(TARGET "BLAS::BLAS")
+      set_target_properties("BLAS::BLAS" PROPERTIES INTERFACE_LINK_LIBRARIES "${BLAS_LIBRARIES}")
+    endif()
+    if(TARGET "LAPACK::LAPACK")
+      set_target_properties("LAPACK::LAPACK" PROPERTIES INTERFACE_LINK_LIBRARIES "${LAPACK_LIBRARIES}")
+    endif()
+  endif()
+endif()
+
 # Fortran unit test interface.  Imported unconditionally (not gated on
 # WITH_TESTS): several subprojects build their test suites without a guard and
 # pull in test-drive themselves.  By resolving the bundled subprojects/test-drive
@@ -153,6 +206,15 @@ if(NOT TARGET "fmlip_relay:fmlip_relay" AND WITH_FMLIP_RELAY)
   add_compile_definitions(WITH_FMLIP_RELAY)
 endif()
 
+# libtorch: native MLIP direct inference (in-process C++/TorchScript)
+if(WITH_LIBTORCH)
+   set(CMAKE_CXX_STANDARD 17)
+   set(CMAKE_CXX_STANDARD_REQUIRED ON)
+   find_package(Torch REQUIRED)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+   add_compile_definitions(WITH_LIBTORCH)
+endif()
+
 # Sources: initialize program sources (prog) and library sources (srcs) empty
 set(prog)
 set(srcs)
@@ -193,6 +255,7 @@ if(WITH_OBJECT AND NOT STATICBUILD)
       $<$<BOOL:${WITH_TOMLF}>:toml-f::toml-f>
       $<$<BOOL:${WITH_LWONIOM}>:lwoniom::lwoniom>
       $<$<BOOL:${WITH_FMLIP_RELAY}>:fmlip_relay::fmlip_relay> 
+      $<$<BOOL:${WITH_LIBTORCH}>:${TORCH_LIBRARIES}>
       $<$<BOOL:${WITH_OpenMP}>:OpenMP::OpenMP_Fortran>
    )
 
@@ -245,6 +308,7 @@ target_link_libraries(
    $<$<BOOL:${WITH_TOMLF}>:toml-f::toml-f>
    $<$<BOOL:${WITH_LWONIOM}>:lwoniom::lwoniom>
    $<$<BOOL:${WITH_FMLIP_RELAY}>:fmlip_relay::fmlip_relay> 
+   $<$<BOOL:${WITH_LIBTORCH}>:${TORCH_LIBRARIES}>
    $<$<BOOL:${STATICBUILD}>:-static>
 )
 
@@ -291,6 +355,7 @@ if (WITH_OBJECT AND NOT STATICBUILD)
       $<$<BOOL:${WITH_TOMLF}>:toml-f::toml-f>
       $<$<BOOL:${WITH_LWONIOM}>:lwoniom::lwoniom>
       $<$<BOOL:${WITH_FMLIP_RELAY}>:fmlip_relay::fmlip_relay> 
+      $<$<BOOL:${WITH_LIBTORCH}>:${TORCH_LIBRARIES}>
    )
 
    set_target_properties(

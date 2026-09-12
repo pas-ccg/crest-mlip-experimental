@@ -281,6 +281,8 @@ subroutine ttconf_light_core(env,mol)
     call ttconf_enable_ring_sampling(env)   !> register the GFN-FF cut-out sampler
     call ttconf_build_ringsites(molc,nsite,site_ngrid,site_step,site_bond,ringset,nrsite)
     call ttconf_disable_ring_sampling()
+    write (stdout,'(1x,a)') 'Ring sampling complete.'
+    flush (stdout)
     if (nrsite > 0) then
       call ttconf_print_ringsites(molc,ringset)
       call ttconf_set_ringset(ringset)   !> activate the geometry overlay
@@ -312,6 +314,7 @@ subroutine ttconf_light_core(env,mol)
     write (stdout,'(1x,a,i0,a)') 'TT-cross sweep '// &
     &  trim(merge('evaluated','optimized',env%ttconf%sp_only))//' ',ngen, &
     &  ' structures (with intact topology).'
+    flush (stdout)
   else
     call smallhead('Brute-force conformer generation (oracle)')
     call ttconf_bruteforce_generate(mol,molc,zrow2site,site_ngrid,site_step,nsite, &
@@ -362,6 +365,7 @@ subroutine ttconf_light_core(env,mol)
       end block
     else
       call smallhead('Optimization and sorting')
+      flush (stdout)
       call optlev_to_multilev(env%optlev,multilevel)
       call crest_multilevel_oloop(env,rawfile,multilevel,0)
     end if

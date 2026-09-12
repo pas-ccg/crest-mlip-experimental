@@ -200,6 +200,204 @@ subroutine crest_sploop(env,nall,structures,eread,silent)
   z = 0  !> counter to process structures in order (1...nall)
 !>--- pre-start server-based calculators before forking OMP threads
   call preinit_mlip_parallel(calculations,T)
+!>=========================================================================
+!> Native MLIP (libtorch) GPU batched fast path
+!>=========================================================================
+!> When a single libtorch level runs on a GPU, the standard OpenMP task
+!> loop is inefficient: each thread calls engrad() one structure at a time
+!> and the forward passes are serialized by the C++ forward_mutex,
+!> underutilizing a GPU which excels at processing many structures at once.
+!>
+!> Instead we pack ALL structures into one contiguous buffer and hand it
+!> to the C++ bridge, which processes it in GPU batches (pipelined,
+!> optionally across multiple GPUs). This bypasses the OpenMP loop.
+!>
+!> Trigger conditions (all required):
+!>   - exactly one calculation level,
+!>   - that level is jobtype%libtorch with a CUDA device selected,
+!>   - all structures share nat and atomic numbers (true for TTConf
+!>     candidate batches: same ligand, different torsions).
+!>
+!> If the conditions are unmet, execution falls through to the standard
+!> per-thread OpenMP path below (also the only path for libtorch on CPU).
+!>=========================================================================
+  block
+    use iso_c_binding, only: c_ptr, c_null_ptr
+    logical :: use_batch_gpu, same_nat, same_at, all_alloc
+    integer :: natb, iat
+    integer :: batch_sz, ngpus, ig
+    real(wp), allocatable :: all_pos(:), all_grad(:), benergies(:)
+    type(c_ptr), allocatable :: gpu_handles(:)
+
+    use_batch_gpu = .false.
+    batch_sz = 0
+    ngpus = 0
+    if (env%calc%ncalculations == 1 .and. &
+        env%calc%calcs(1)%id == jobtype%libtorch .and. &
+        (env%calc%calcs(1)%libtorch_device_id > 0 .or. env%calc%mlip_batch_opt) .and. &
+        nall > 0) then
+
+      natb = structures(1)%nat
+      all_alloc = .true.
+      same_nat = .true.
+      do i = 1,nall
+        if (.not.allocated(structures(i)%xyz).or..not.allocated(structures(i)%at)) &
+        &  all_alloc = .false.
+        if (structures(i)%nat /= natb) same_nat = .false.
+      end do
+      same_at = .true.
+      if (same_nat) then
+        do i = 2,nall
+          do iat = 1,natb
+            if (structures(i)%at(iat) /= structures(1)%at(iat)) then
+              same_at = .false.
+              exit
+            end if
+          end do
+          if (.not.same_at) exit
+        end do
+      end if
+
+      use_batch_gpu = all_alloc .and. same_nat .and. same_at
+      if (.not.use_batch_gpu .and. .not.quiet) then
+        write (stdout,'(a)') ' [libtorch] non-uniform structure list (nat/atomic numbers): '// &
+        & 'falling back to the per-thread path'
+      end if
+    end if
+
+    if (use_batch_gpu) then
+      !> determine batch size and number of GPUs
+      batch_sz = env%calc%calcs(1)%mlip_batch_size
+      if (batch_sz <= 0) batch_sz = mlip_auto_batch_size(natb)
+      ngpus = env%calc%calcs(1)%mlip_ngpus
+      if (ngpus <= 0) then
+        ngpus = libtorch_get_cuda_device_count_f()
+        if (ngpus > 2) ngpus = 2  !> cap at 2 for safety
+      end if
+      if (ngpus < 1) ngpus = 1
+
+      !> configure the ATen thread count for the shared model
+      if (env%calc%calcs(1)%mlip_aten_threads > 0) then
+        call libtorch_set_threads(env%calc%calcs(1)%mlip_aten_threads)
+      else
+        call libtorch_set_threads(1)  !> GPU handles parallelism internally
+      end if
+
+      if (env%calc%calcs(1)%libtorch_debug) then
+        write (stdout,'(a,i0,a,i0,a,i0,a)') &
+          ' [libtorch] GPU pipelined mode: ', nall, &
+          ' structures, batch_size=', batch_sz, ', ngpus=', ngpus, ''
+      end if
+
+      !> pack ALL positions into a contiguous buffer for the C++ bridge
+      !> (Bohr; the bridge converts to Angstrom for the MACE-LAMMPS format)
+      allocate (all_pos(3*natb*nall))
+      allocate (all_grad(3*natb*nall),source=0.0_wp)
+      allocate (benergies(nall),source=0.0_wp)
+      do i = 1,nall
+        all_pos((i-1)*3*natb+1:i*3*natb) = reshape(structures(i)%xyz, [3*natb])
+      end do
+
+      if (ngpus == 1) then
+        !> --- single GPU: pipelined batch inference ---
+        call libtorch_init_shared(env%calc%calcs(1), io)
+        if (io == 0) then
+          call libtorch_engrad_batch_pipeline_f(env%calc%calcs(1), &
+            nall, natb, structures(1)%at, all_pos, benergies, all_grad, &
+            batch_sz, io)
+        end if
+      else
+        !> --- multi-GPU: interleaved pipelined batch inference ---
+        allocate (gpu_handles(ngpus))
+        io = 0
+        do ig = 1, ngpus
+          call libtorch_load_shared_on_device_f(env%calc%calcs(1), &
+            ig-1, gpu_handles(ig), io)
+          if (io /= 0) then
+            write (stdout,'(a,i0)') '**ERROR** libtorch: failed to load model on CUDA:', ig-1
+            exit
+          end if
+        end do
+        if (io == 0) then
+          call libtorch_engrad_batch_multigpu_f(gpu_handles, ngpus, &
+            nall, natb, structures(1)%at, all_pos, &
+            env%calc%calcs(1)%chrg, env%calc%calcs(1)%multiplicity - 1, &
+            benergies, all_grad, &
+            batch_sz, io)
+        end if
+        deallocate (gpu_handles)
+      end if
+
+      !> write the energies back into the structure list
+      c = 0
+      if (io == 0) then
+        do i = 1,nall
+          structures(i)%energy = benergies(i)
+          c = c+1
+        end do
+      else
+        write (stdout,'(a)') '**ERROR** libtorch GPU batched evaluation failed'
+      end if
+      if (present(eread)) eread(:) = benergies(:)
+
+      deallocate (all_pos, all_grad, benergies)
+
+      !> progress: the batch path is one monolithic call, the bar jumps
+      !> from 0 to 100% once the C++ pipeline has finished
+      if (.not.quiet) call progress_update(env%ps,nall,nall)
+
+      !> release the shared model unless the user wants to keep it loaded
+      !> for subsequent calls (e.g. repeated TTConf batches); in that case
+      !> the model stays in the C++ registry and is released at program exit
+      if (.not.env%calc%mlip_keep_loaded) then
+        call libtorch_shared_cleanup()
+        env%calc%calcs(1)%libtorch_handle = c_null_ptr
+        env%calc%calcs(1)%libtorch_is_shared = .false.
+      end if
+
+      !> finalize progress display
+      if (.not.quiet) call progress_finish(env%ps)
+
+      !> stop timer and print summary
+      call profiler%stop(1)
+      if (.not.quiet) then
+        percent = float(c)/float(nall)*100.0_wp
+        write (atmp,'(f5.1,a)') percent,'% success)'
+        write (stdout,'(">",1x,i0,a,i0,a,a)') c,' of ',nall,' structures successfully evaluated (', &
+        &     trim(adjustl(atmp))
+        write (atmp,'(">",1x,a,i0,a)') 'Total runtime for ',nall,' singlepoint calculations:'
+        call profiler%write_timing(stdout,1,trim(atmp),.true.)
+        runtime = profiler%get(1)
+        write (atmp,'(f16.3,a)') runtime/real(nall,wp),' sec'
+        write (stdout,'(a,a,a)') '> Corresponding to approximately ',trim(adjustl(atmp)), &
+        &                       ' per processed structure'
+      end if
+
+      call profiler%clear()
+      deallocate (calculations)
+      if (allocated(mols)) deallocate (mols)
+      return
+    end if
+  end block
+
+!>--- libtorch on the standard per-thread path: informational notes
+  do j = 1,env%calc%ncalculations
+    if (env%calc%calcs(j)%id == jobtype%libtorch .and. &
+        env%calc%calcs(j)%libtorch_device_id == 0) then
+      write (stdout,'(a)') ' [libtorch] NOTE: Running MLIP on CPU. For production '// &
+      & 'throughput, set device="cuda". For CPU-only work, consider method="gfn2".'
+      exit
+    end if
+    if (env%calc%calcs(j)%id == jobtype%libtorch .and. &
+        env%calc%calcs(j)%libtorch_device_id > 0 .and. T > 1) then
+      write (stdout,'(a)') ' [libtorch] WARNING: GPU MLIP fell through to the '// &
+      & 'per-thread OpenMP path. All forward passes are serialized by '// &
+      & 'forward_mutex - this is SLOWER than the batched GPU path.'
+      write (stdout,'(a)') '   (the batched path needs a single calculation '// &
+      & 'level, uniform nat/atomic numbers and nall > 0)'
+      exit
+    end if
+  end do
 !>--- loop over the structures
   !$omp parallel &
   !$omp shared(env,calculations,nall,structures,c,k,z,mols,nested,Tn)
@@ -517,6 +715,386 @@ end subroutine crest_hessloop
 !> Routines for concurrent geometry optimization
 !========================================================================================!
 !========================================================================================!
+subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich2,quiet)
+!*******************************************************************************
+!* subroutine mlip_batch_oloop
+!* Phase C: batched native MLIP (libtorch) geometry optimization for a uniform
+!* list of structures.
+!*
+!* Keeps N independent L-BFGS optimizer states (one per structure) and issues
+!* exactly ONE batched energy+gradient evaluation per outer iteration; the
+!* C++ bridge processes the packed buffer in GPU batches (pipelined, optionally
+!* across several GPUs). On CPU the batched call degrades to sequential
+!* single-structure forwards of one shared model instance.
+!*
+!* The per-structure algorithm mirrors lbfgs_module: fixed base step 0.2 with
+!* 0.25 backtracking on energy rise, limited-memory BFGS history of length
+!* lbfgs_histsize, and the E/G convergence thresholds of get_optthr. The
+!* line search is "amortized": a rejected trial step is retried in the NEXT
+!* batched call (per-structure state machine), so every outer iteration costs
+!* exactly one batched E+G call no matter how many structures are active.
+!*
+!* Conventions are identical to crest_oloop_struc: converged geometries and
+!* energies are written back into structures; failed optimizations receive an
+!* energy of +1.0 (unless anopt is set). xyz is in Bohr(!).
+!******************************************************************************
+  use crest_parameters,only:wp,stdout
+  use crest_calculator
+  use crest_data
+  use strucrd
+  use optimize_type,only:optimizer
+  use optimize_utils,only:get_optthr
+  use term_ui,only:progress_init,progress_update,progress_finish
+  use iso_c_binding,only:c_ptr,c_null_ptr
+  implicit none
+  type(systemdata),intent(inout) :: env
+  type(calcdata),intent(inout) :: mycalc
+  type(calcdata),intent(inout) :: calculations(:)
+  integer,intent(in) :: nall
+  type(coord),intent(inout) :: structures(nall)
+  logical,intent(in) :: dump
+  integer,intent(in) :: ich,ich2
+  logical,intent(in) :: quiet
+
+  !> per-structure L-BFGS state
+  type(optimizer),allocatable :: OPT(:)
+  real(wp),allocatable :: xacc(:,:),gcand(:,:),xnew(:,:),dirc(:,:),gacc(:,:),gnew(:)
+  real(wp),allocatable :: eacc(:),stepz(:),qtmp(:)
+  integer,allocatable :: khist(:),iterc(:),retry(:)
+  logical,allocatable :: active(:),pending(:)
+  !> batch buffers
+  real(wp),allocatable :: all_pos(:),all_grad(:),benergies(:)
+  type(c_ptr),allocatable :: gpu_handles(:)
+  !> settings / bookkeeping
+  integer :: natb,nvarb,mhist,maxcycle_i,batch_sz,ngpus,ig,io
+  integer :: outer,nact,p,done_count,i,j,c,k,tight
+  integer(8) :: tc0,tc1,tcrate
+  real(wp) :: ethr,gthr,maxerise,deltaE,gnorm,gamm,yy,ss
+  logical :: econv,gconv
+  character(len=80) :: atmp
+  real(wp) :: percent,runtime
+  type(timer) :: profiler
+  type(coord) :: molnew
+
+  natb = structures(1)%nat
+  nvarb = 3*natb
+  mhist = mycalc%lbfgs_histsize
+
+!>--- convergence thresholds (same as lbfgs_module; tight is a scratch copy
+!>--- because get_optthr may rewrite it and auto-set maxcycle on mycalc)
+  tight = mycalc%optlev
+  call get_optthr(natb,tight,mycalc,ethr,gthr)
+  maxcycle_i = mycalc%maxcycle
+  maxerise = mycalc%maxerise
+
+!>--- allocate per-structure optimizer state
+  allocate (OPT(nall))
+  allocate (xacc(nvarb,nall),gcand(nvarb,nall),xnew(nvarb,nall),dirc(nvarb,nall))
+  allocate (gacc(nvarb,nall),gnew(nvarb))
+  allocate (eacc(nall),stepz(nall),qtmp(nvarb))
+  allocate (khist(nall),iterc(nall),retry(nall))
+  allocate (active(nall),pending(nall))
+
+  do i = 1,nall
+    call OPT(i)%allocatelbfgs(nvarb,mhist)
+    OPT(i)%S = 0.0_wp
+    OPT(i)%Y = 0.0_wp
+    OPT(i)%rho = 0.0_wp
+    xacc(:,i) = reshape(structures(i)%xyz,[nvarb])
+    gcand(:,i) = xacc(:,i)  !> first batch call evaluates the start geometry
+    eacc(i) = 0.0_wp
+    stepz(i) = 0.2_wp
+    khist(i) = 0
+    iterc(i) = 0
+    retry(i) = 0
+    pending(i) = .false.
+    active(i) = .true.
+  end do
+
+!>--- batch settings (same logic as the sploop GPU fast path)
+  batch_sz = mycalc%calcs(1)%mlip_batch_size
+  if (batch_sz <= 0) batch_sz = mlip_auto_batch_size(natb)
+  ngpus = mycalc%calcs(1)%mlip_ngpus
+  if (ngpus <= 0) then
+    ngpus = libtorch_get_cuda_device_count_f()
+    if (ngpus > 2) ngpus = 2  !> cap at 2 for safety
+  end if
+  if (ngpus < 1) ngpus = 1
+
+  if (mycalc%calcs(1)%mlip_aten_threads > 0) then
+    call libtorch_set_threads(mycalc%calcs(1)%mlip_aten_threads)
+  else
+    call libtorch_set_threads(1)  !> the batched driver is single-threaded here
+  end if
+
+  if (mycalc%calcs(1)%libtorch_debug) then
+    write (stdout,'(a,i0,a,i0,a,i0,a)') &
+      ' [libtorch] batched optimizer: ', nall, &
+      ' structures, batch_size=', batch_sz, ', ngpus=', ngpus, ''
+    flush (stdout)
+  end if
+
+!>--- batch buffers (sized for the full list; the active subset is repacked
+!>--- each iteration)
+  allocate (all_pos(3*natb*nall))
+  allocate (all_grad(3*natb*nall),source=0.0_wp)
+  allocate (benergies(nall),source=0.0_wp)
+
+!>--- load the shared model ONCE; it is reused across all outer iterations
+  io = 0
+  if (mycalc%calcs(1)%libtorch_device_id > 0 .and. ngpus > 1) then
+    allocate (gpu_handles(ngpus))
+    do ig = 1,ngpus
+      call libtorch_load_shared_on_device_f(mycalc%calcs(1),ig-1,gpu_handles(ig),io)
+      if (io /= 0) then
+        write (stdout,'(a,i0)') '**ERROR** libtorch: failed to load model on CUDA:',ig-1
+        exit
+      end if
+    end do
+  else
+    call libtorch_init_shared(mycalc%calcs(1),io)
+    if (io /= 0) then
+      write (stdout,'(a)') '**ERROR** libtorch: failed to load shared model for the batched optimizer'
+    end if
+  end if
+  if (io /= 0) then
+    do i = 1,nall
+      structures(i)%energy = 1.0_wp
+    end do
+    return
+  end if
+
+!>--- ensure etmp is allocated so calc_eprint can be used for the dump files
+  if (.not.allocated(calculations(1)%etmp)) &
+    allocate (calculations(1)%etmp(mycalc%ncalculations),source=0.0_wp)
+
+  call profiler%init(1)
+  call profiler%start(1)
+  if (.not.quiet) then
+    call progress_init(env%ps,nall,width=50,prefix=" ↳ ", &
+      &                suffix="",show_time=.true.,show_eta=.false.)
+    call progress_update(env%ps,0,nall)
+  end if
+
+!>--- main loop: exactly ONE batched E+G evaluation per outer iteration
+  c = 0
+  k = 0
+  outer = 0
+  do while (count(active) > 0 .and. outer < maxcycle_i*13 .and. io == 0)
+    outer = outer+1
+    nact = count(active)
+
+!>--- pack the current candidate geometries of all active structures (Bohr)
+    p = 0
+    do i = 1,nall
+      if (active(i)) then
+        p = p+1
+        all_pos((p-1)*nvarb+1:p*nvarb) = gcand(:,i)
+      end if
+    end do
+
+!>--- the single batched E+G evaluation of this iteration
+    if (mycalc%calcs(1)%libtorch_debug) call system_clock(tc0,tcrate)
+    if (ngpus > 1 .and. mycalc%calcs(1)%libtorch_device_id > 0) then
+      call libtorch_engrad_batch_multigpu_f(gpu_handles,ngpus,nact,natb, &
+        structures(1)%at,all_pos, &
+        mycalc%calcs(1)%chrg, mycalc%calcs(1)%multiplicity - 1, &
+        benergies,all_grad,batch_sz,io)
+    else
+      call libtorch_engrad_batch_pipeline_f(mycalc%calcs(1),nact,natb, &
+        structures(1)%at,all_pos,benergies,all_grad,batch_sz,io)
+    end if
+    if (mycalc%calcs(1)%libtorch_debug) then
+      call system_clock(tc1,tcrate)
+      write (stdout,'(a,i0,a,i0,a,f8.2,a)') ' [libtorch batch] iter=',outer, &
+        ' nact=',nact,'  t=',real(tc1-tc0,wp)/real(tcrate,wp)*1000.0_wp,'ms'
+      flush (stdout)
+    end if
+    if (io /= 0) then
+      write (stdout,'(a)') '**ERROR** libtorch batched optimizer: batched E+G call failed'
+      exit
+    end if
+
+!>--- per-structure L-BFGS state update
+    p = 0
+    do i = 1,nall
+      if (.not.active(i)) cycle
+      p = p+1
+      gnew = all_grad((p-1)*nvarb+1:p*nvarb)
+      gnorm = sqrt(dot_product(gnew,gnew))
+
+      if (.not.pending(i)) then
+!>--- the evaluation was at the current (accepted) point: compute the search
+!>--- direction and propose the next trial step (to be evaluated in the
+!>--- following batch)
+        gacc(:,i) = gnew
+        eacc(i) = benergies(p)
+        iterc(i) = iterc(i)+1
+        if (khist(i) == 0) then
+          dirc(:,i) = -gnew
+        else
+          yy = dot_product(OPT(i)%Y(1:nvarb,khist(i)),OPT(i)%Y(1:nvarb,khist(i)))
+          if (yy > 1.0d-30) then
+            gamm = dot_product(OPT(i)%S(1:nvarb,khist(i)),OPT(i)%Y(1:nvarb,khist(i)))/yy
+          else
+            gamm = 1.0_wp
+          end if
+          qtmp = gnew
+          do j = khist(i),1,-1
+            OPT(i)%alpha(j) = OPT(i)%rho(j)*dot_product(OPT(i)%S(1:nvarb,j),qtmp)
+            qtmp = qtmp-OPT(i)%alpha(j)*OPT(i)%Y(1:nvarb,j)
+          end do
+          xnew(:,i) = gamm*qtmp
+          do j = 1,khist(i)
+            xnew(:,i) = xnew(:,i)+OPT(i)%S(1:nvarb,j)*(OPT(i)%alpha(j)- &
+              & OPT(i)%rho(j)*dot_product(OPT(i)%Y(1:nvarb,j),xnew(:,i)))
+          end do
+          dirc(:,i) = -xnew(:,i)
+        end if
+        stepz(i) = 0.2_wp
+        retry(i) = 0
+        gcand(:,i) = xacc(:,i)+stepz(i)*dirc(:,i)
+        pending(i) = .true.
+        cycle
+      end if
+
+!>--- the evaluation was at a trial point gcand = xacc + stepz*dirc
+      deltaE = benergies(p)-eacc(i)
+      if (deltaE > maxerise) then
+!>--- energy rise: shrink the step, retry in the next batched call
+        retry(i) = retry(i)+1
+        iterc(i) = iterc(i)+1  !> count rejected evaluations toward the
+                                !> per-structure budget; otherwise a stuck
+                                !> structure burns the whole global cap
+                                !> (13*maxcycle) and may exit the loop with
+                                !> xyz/energy never updated
+        if (iterc(i) >= maxcycle_i) then
+          active(i) = .false.
+          if (mycalc%anopt) then
+            c = c+1
+            structures(i)%xyz = reshape(xacc(:,i),[3,natb])
+            structures(i)%energy = eacc(i)
+          else
+            structures(i)%energy = 1.0_wp
+          end if
+          cycle
+        end if
+        if (retry(i) > 12) then
+!>--- stuck: restart from the steepest descent direction with a full step
+          dirc(:,i) = -gnew
+          khist(i) = 0
+          retry(i) = 0
+          stepz(i) = 0.2_wp
+        end if
+        stepz(i) = stepz(i)*0.25_wp
+        gcand(:,i) = xacc(:,i)+stepz(i)*dirc(:,i)
+        cycle
+      end if
+
+!>--- accept the step and update the L-BFGS history
+      xnew(:,i) = gcand(:,i)-xacc(:,i)
+      ss = dot_product(gnew-gacc(:,i),xnew(:,i))
+      if (abs(ss) > 1.0d-30) then
+        if (khist(i) < mhist) then
+          khist(i) = khist(i)+1
+          OPT(i)%S(1:nvarb,khist(i)) = xnew(:,i)
+          OPT(i)%Y(1:nvarb,khist(i)) = gnew-gacc(:,i)
+        else
+          OPT(i)%S(1:nvarb,1:mhist-1) = OPT(i)%S(1:nvarb,2:mhist)
+          OPT(i)%Y(1:nvarb,1:mhist-1) = OPT(i)%Y(1:nvarb,2:mhist)
+          OPT(i)%S(1:nvarb,mhist) = xnew(:,i)
+          OPT(i)%Y(1:nvarb,mhist) = gnew-gacc(:,i)
+        end if
+        OPT(i)%rho(khist(i)) = 1.0_wp/ss
+      end if
+      xacc(:,i) = gcand(:,i)
+      eacc(i) = benergies(p)
+      pending(i) = .false.
+
+!>--- convergence bookkeeping (identical criteria to lbfgs_module)
+      econv = abs(deltaE) .lt. ethr
+      gconv = gnorm .lt. gthr
+      if (econv .and. gconv) then
+        active(i) = .false.
+        c = c+1
+        structures(i)%xyz = reshape(xacc(:,i),[3,natb])
+        structures(i)%energy = eacc(i)
+        if (dump) then
+          molnew%nat = natb
+          molnew%at = structures(i)%at
+          molnew%xyz = structures(i)%xyz
+          molnew%energy = eacc(i)  !> appendcoord prefixes " energy= <self%energy>";
+                                    !> keep it the real value so grepenergy (CREGEN
+                                    !> sorting) does not read a stale/zero energy
+          write (atmp,'(1x,"energy=",f16.10,1x,"g norm=",f12.8)') eacc(i),gnorm
+          molnew%comment = trim(atmp)
+          call molnew%append(ich)
+          calculations(1)%etmp(1) = eacc(i)
+          call calc_eprint(calculations(1),eacc(i),calculations(1)%etmp,gnorm,ich2)
+        end if
+      else if (iterc(i) >= maxcycle_i) then
+        active(i) = .false.
+        if (mycalc%anopt) then
+          c = c+1
+          structures(i)%xyz = reshape(xacc(:,i),[3,natb])
+          structures(i)%energy = eacc(i)
+        else
+          structures(i)%energy = 1.0_wp
+        end if
+      end if
+    end do
+
+    k = k+1
+    if (.not.quiet) then
+      done_count = nall-count(active)
+      call progress_update(env%ps,done_count,nall)
+    end if
+  end do
+
+!>--- structures still active after a failed batch call: failure energy
+  if (io /= 0) then
+    do i = 1,nall
+      if (active(i)) structures(i)%energy = 1.0_wp
+    end do
+  end if
+
+!>--- finalize progress display
+  if (.not.quiet) call progress_finish(env%ps)
+
+!>--- stop timer and print summary (mirrors crest_oloop_struc)
+  call profiler%stop(1)
+  if (.not.quiet) then
+    percent = float(c)/float(nall)*100.0_wp
+    write (atmp,'(f5.1,a)') percent,'% success)'
+    write (stdout,'(">",1x,i0,a,i0,a,a)') c,' of ',nall,' structures successfully optimized (', &
+    &     trim(adjustl(atmp))
+    write (atmp,'(">",1x,a,i0,a)') 'Total runtime for ',nall,' optimizations:'
+    call profiler%write_timing(stdout,1,trim(atmp),.true.)
+    runtime = profiler%get(1)
+    write (atmp,'(f16.3,a)') runtime/real(nall,wp),' sec'
+    write (stdout,'(a,a,a)') '> Corresponding to approximately ',trim(adjustl(atmp)), &
+    &                       ' per processed structure'
+  end if
+  call profiler%clear()
+
+!>--- release the shared model unless the user wants to keep it loaded for
+!>--- subsequent calls (e.g. repeated TTConf batches); otherwise it stays in
+!>--- the C++ registry until program exit (cleanup.f90 releases it)
+  if (.not.mycalc%mlip_keep_loaded) then
+    call libtorch_shared_cleanup()
+    mycalc%calcs(1)%libtorch_handle = c_null_ptr
+    mycalc%calcs(1)%libtorch_is_shared = .false.
+  end if
+
+!>--- deallocate
+  deallocate (OPT,xacc,gcand,xnew,dirc,gacc,gnew,eacc,stepz,qtmp)
+  deallocate (khist,iterc,retry,active,pending)
+  deallocate (all_pos,all_grad,benergies)
+  if (allocated(gpu_handles)) deallocate (gpu_handles)
+  return
+end subroutine mlip_batch_oloop
+
+!========================================================================================!
 subroutine crest_oloop_struc(env,nall,structures,dump,customcalc,eread,silent)
 !*******************************************************************************
 !* subroutine crest_oloop_struc
@@ -566,6 +1144,23 @@ subroutine crest_oloop_struc(env,nall,structures,dump,customcalc,eread,silent)
   type(timer) :: profiler
   integer :: T,Tn  !> threads and threads per core
   logical :: nested
+  interface
+    subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich2,quiet)
+      use crest_parameters,only:wp,stdout
+      use crest_calculator
+      use crest_data
+      use strucrd
+      implicit none
+      type(systemdata),intent(inout) :: env
+      type(calcdata),intent(inout) :: mycalc
+      type(calcdata),intent(inout) :: calculations(:)
+      integer,intent(in) :: nall
+      type(coord),intent(inout) :: structures(nall)
+      logical,intent(in) :: dump
+      integer,intent(in) :: ich,ich2
+      logical,intent(in) :: quiet
+    end subroutine mlip_batch_oloop
+  end interface
 
 !>--- check which calc to use
   if (present(customcalc)) then
@@ -635,6 +1230,66 @@ subroutine crest_oloop_struc(env,nall,structures,dump,customcalc,eread,silent)
   z = 0  !> counter to perform optimization in right order (1...nall)
 !>--- pre-start server-based calculators before forking OMP threads
   call preinit_mlip_parallel(calculations,T)
+!>=========================================================================
+!> Phase C: native MLIP (libtorch) batched optimizer fast path
+!>=========================================================================
+!> For a uniform structure list on a single native MLIP level, the batched
+!> L-BFGS driver keeps one optimizer state per structure and issues exactly
+!> ONE batched E+G call per outer iteration (GPU-batched and pipelined in
+!> the C++ bridge). Trigger: one libtorch level, uniform nat/atomic numbers,
+!> and a GPU device OR an explicit mlip_batch_opt request. Otherwise
+!> execution falls through to the standard per-thread OpenMP path below.
+!>=========================================================================
+  block
+    logical :: use_batch, same_nat, same_at, all_alloc
+    integer :: natb2, iat
+    use_batch = .false.
+    if (mycalc%ncalculations == 1 .and. &
+        mycalc%calcs(1)%id == jobtype%libtorch .and. nall > 0) then
+      natb2 = structures(1)%nat
+      all_alloc = .true.
+      same_nat = .true.
+      do i = 1,nall
+        if (.not.allocated(structures(i)%xyz).or..not.allocated(structures(i)%at)) &
+        &  all_alloc = .false.
+        if (structures(i)%nat /= natb2) same_nat = .false.
+      end do
+      same_at = .true.
+      if (same_nat) then
+        do i = 2,nall
+          do iat = 1,natb2
+            if (structures(i)%at(iat) /= structures(1)%at(iat)) then
+              same_at = .false.
+              exit
+            end if
+          end do
+          if (.not.same_at) exit
+        end do
+      end if
+      use_batch = all_alloc .and. same_nat .and. same_at .and. &
+        & (mycalc%calcs(1)%libtorch_device_id > 0 .or. mycalc%mlip_batch_opt)
+      if (.not.use_batch .and. .not.quiet) then
+        write (stdout,'(a)') ' [libtorch] non-uniform structure list (nat/atomic numbers): '// &
+        & 'falling back to the per-thread optimization path'
+      end if
+    end if
+    if (use_batch) then
+      call mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich2,quiet)
+      if (present(eread)) then
+        do i = 1,nall
+          eread(i) = structures(i)%energy
+        end do
+      end if
+!>--- close the dump units before the early return; otherwise the Fortran
+!>--- buffers are never flushed and the ensemble file is truncated on disk
+!>--- (fd leak: units stay open until program exit)
+      if (dump) then
+        close (ich)
+        close (ich2)
+      end if
+      return
+    end if
+  end block
 !>--- loop over ensemble
   !$omp parallel &
   !$omp shared(env,calculations,nall,structures,c,k,z,pr,wr,dump) &

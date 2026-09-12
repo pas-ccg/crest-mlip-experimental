@@ -373,6 +373,30 @@ if with_fmlip
   add_project_arguments('-DWITH_FMLIP_RELAY', language : ['c', 'fortran'])
 endif
 
+# ── libtorch: native MLIP direct inference (in-process C++/TorchScript) ─────────
+# Disabled by default: requires a libtorch (PyTorch) C++ installation whose
+# CMake config files (TorchConfig.cmake) are discoverable, e.g. a PyTorch
+# python install. Meson is told where to look via the CMake prefix path:
+#   export TORCH_CMAKE_DIR=$(python3 -c "import torch;print(torch.utils.cmake_prefix_path)")
+with_libtorch = false
+libtorch_dep = declare_dependency()
+if get_option('libtorch').allowed()
+  add_languages('cpp', required: true)
+  _cxx = meson.get_compiler('cpp')
+  _cxx17 = _cxx.get_supported_arguments(['-std=c++17'])
+  if _cxx17.length() > 0
+    add_project_arguments(_cxx17, language: 'cpp')
+  endif
+  libtorch_dep = dependency('Torch', method: 'cmake', required: false)
+  if not libtorch_dep.found()
+    error('libtorch requested (-Dlibtorch=enabled) but the Torch CMake config was not found. ' +
+      'Install PyTorch/libtorch and make its CMake files discoverable, e.g.: ' +
+      'TORCH_CMAKE_DIR=$(python3 -c "import torch;print(torch.utils.cmake_prefix_path)")')
+  endif
+  add_project_arguments('-DWITH_LIBTORCH', language: ['c', 'cpp', 'fortran'])
+  with_libtorch = true
+endif
+
 if get_option('tests')
   testdrive_dep = dependency('test-drive',
     version  : '>=0.4.0',
@@ -396,6 +420,7 @@ metadata_conf.set('ddxvar',     with_ddx.to_string())
 metadata_conf.set('libpvolvar', with_libpvol.to_string())
 metadata_conf.set('lwoniomvar', with_lwoniom.to_string())
 metadata_conf.set('fmliprelayvar', with_fmlip.to_string())
+metadata_conf.set('libtorchvar', with_libtorch.to_string())
 
 configure_file(
   input         : 'assets/template/metadata.f90',
@@ -414,7 +439,7 @@ subdir('src')
 #  Build targets
 # ═══════════════════════════════════════════════════════════════════════════════
 _optional_deps = []
-foreach d : [tblite_dep, gfn0_dep, gfnff_dep, libpvol_dep, lwoniom_dep, tomlf_dep, fmlip_dep]
+foreach d : [tblite_dep, gfn0_dep, gfnff_dep, libpvol_dep, lwoniom_dep, tomlf_dep, fmlip_dep, libtorch_dep]
   if d.found()
     _optional_deps += [d]
   endif
@@ -477,5 +502,6 @@ summary({
   'libpvol'          : with_libpvol,
   'lwONIOM'          : with_lwoniom,
   'fmlip-relay'      : with_fmlip,
+  'libtorch (native MLIP)' : with_libtorch,
   'Unit tests'       : get_option('tests'),
 }, section : 'crest build configuration')
