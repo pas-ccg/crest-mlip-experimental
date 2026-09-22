@@ -327,7 +327,10 @@ module crest_data
 !******************************************
 !* separate storage of REFERENCE STRUCTURE
 !******************************************
-    integer :: nat
+    integer :: nat = 0   !> default 0: an unset reference must read as an
+                         !> empty molecule, never as uninitialized garbage
+                         !> (garbage nat crashed axis() during TOML parsing
+                         !>  of ensemble-only runtypes like mdopt)
     integer,allocatable :: at(:)
     real(wp),allocatable :: xyz(:,:)
     real(wp),allocatable :: lat(:,:)    !> lattice vectors (PBC, optional)

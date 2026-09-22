@@ -92,7 +92,15 @@ contains !> MODULE PROCEDURES START HERE
     included = .false.
     call calc%reset()
     call env%ref%to(moltmp)
-    call axis(moltmp%nat,moltmp%at,moltmp%xyz)
+    !>--- align the reference molecule with its principal axes.
+    !>--- Guard: at this point the reference may not have been loaded yet —
+    !>--- TOML runtypes that only specify an ensemble file (e.g. mdopt with
+    !>--- ensemble= but no input=) load env%ref later, in inputcoords().
+    !>--- Calling axis() on an unloaded reference (nat=0, at/xyz not
+    !>--- allocated) dereferences uninitialized memory and can segfault.
+    if (moltmp%nat > 0 .and. allocated(moltmp%at) .and. allocated(moltmp%xyz)) then
+      call axis(moltmp%nat,moltmp%at,moltmp%xyz)
+    end if
 
     do i = 1,dict%nblk
       call blk%deallocate()

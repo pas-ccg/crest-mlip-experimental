@@ -51,7 +51,12 @@ add_subdirectory("config")
 # LAPACK, BLAS, OpenMP (usually via shared dependencies)
 if(STATICBUILD)
  set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
- set(CMAKE_EXE_LINKER_FLAGS "-static")
+ #> The actual static link is applied per-target via the '-static' genex
+ #> on lib-crest-static / crest-exe (see below). It is deliberately NOT put
+ #> into CMAKE_EXE_LINKER_FLAGS: the Torch/CUDA configure probes link the
+ #> shared libcudart, and GNU ld rejects a shared object when -static is
+ #> in effect for the whole link line (ld: "attempted static link of
+ #> dynamic object libcudart.so").
  set(CMAKE_LINK_SEARCH_START_STATIC TRUE)
  set(CMAKE_LINK_SEARCH_END_STATIC TRUE)
  set(BLA_STATIC ON)
@@ -210,7 +215,19 @@ endif()
 if(WITH_LIBTORCH)
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+   #> STATICBUILD restricts find_library to ".a" archives, but the distributed
+   #> libtorch (and the CUDA runtime libraries it probes for) ship shared
+   #> libraries only. Temporarily widen the suffix list for the Torch/CUDA
+   #> package discovery; the final link still mixes the shared torch/CUDA
+   #> objects with the static CREST core (the batched GPU path needs them).
+   if(STATICBUILD)
+      set(_staticbuild_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+      set(CMAKE_FIND_LIBRARY_SUFFIXES ".so" ".so.6" ".so.9" ".so.10" ".so.11" ".so.12" ".a")
+   endif()
    find_package(Torch REQUIRED)
+   if(STATICBUILD)
+      set(CMAKE_FIND_LIBRARY_SUFFIXES "${_staticbuild_saved_suffixes}")
+   endif()
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
    add_compile_definitions(WITH_LIBTORCH)
 endif()

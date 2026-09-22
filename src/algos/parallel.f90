@@ -183,6 +183,10 @@ subroutine crest_sploop(env,nall,structures,eread,silent)
     calculations(i)%pr_energies = .false.
   end do
 
+!>--- broadcast the shared libtorch handle into the per-thread copies so the
+!>--- OMP threads do not each lazy-load their own (leaking) model instance
+  call broadcast_libtorch_shared_handles(env%calc,T,calculations)
+
 !>--- timer initialization
   call profiler%init(1)
   call profiler%start(1)
@@ -571,6 +575,10 @@ subroutine crest_hessloop(env,nat,nall,at,xyz,eread,gt_out,stot_out)
     allocate (mols(i)%at(nat),mols(i)%xyz(3,nat))
   end do
 
+!>--- broadcast the shared libtorch handle into the per-thread copies so the
+!>--- OMP threads do not each lazy-load their own (leaking) model instance
+  call broadcast_libtorch_shared_handles(env%calc,T,calculations)
+
 !>--- thermo settings
   !> inversion threshold
   ithr = env%thermo%ithr
@@ -924,12 +932,14 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
       gnorm = sqrt(dot_product(gnew,gnew))
 
       if (.not.pending(i)) then
-!>--- the evaluation was at the current (accepted) point: compute the search
-!>--- direction and propose the next trial step (to be evaluated in the
-!>--- following batch)
+!>--- one-time initial evaluation of the start geometry: record E+G,
+!>--- compute the first search direction and propose the first trial.
+!>--- (In steady state every structure always has a pending trial; the
+!>--- gradient of an accepted trial point IS the gradient of the new
+!>--- current point, so no current-point re-evaluation is needed — the
+!>--- old ping-pong design paid 2 batch calls per L-BFGS cycle.)
         gacc(:,i) = gnew
         eacc(i) = benergies(p)
-        iterc(i) = iterc(i)+1
         if (khist(i) == 0) then
           dirc(:,i) = -gnew
         else
@@ -961,14 +971,20 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
 !>--- the evaluation was at a trial point gcand = xacc + stepz*dirc
       deltaE = benergies(p)-eacc(i)
       if (deltaE > maxerise) then
-!>--- energy rise: shrink the step, retry in the next batched call
+!>--- energy rise: shrink the step and retry in the next batched call.
+!>--- Like lbfgs_module the line search is unbounded (step *= 0.25) and
+!>--- trials do NOT count toward the per-structure budget: the budget
+!>--- counts accepted L-BFGS cycles, identical to the standard
+!>--- per-thread optimizer. The old hard restart after 12 rejections
+!>--- (dirc=-g, khist=0, full step) destroyed the L-BFGS history every
+!>--- ~13 evaluations on soft torsion modes, so structures oscillated
+!>--- between "overshooting L-BFGS step" and "steepest-descent restart"
+!>--- until the whole budget was burned (rounds ran ~2*maxcycle outer
+!>--- iterations, nact flat until the budget hit). A structure that is
+!>--- still shrinking after 60 rejections (step < 0.2*0.25^60 ~ 1e-31)
+!>--- is numerically stuck: deactivate with the best point.
         retry(i) = retry(i)+1
-        iterc(i) = iterc(i)+1  !> count rejected evaluations toward the
-                                !> per-structure budget; otherwise a stuck
-                                !> structure burns the whole global cap
-                                !> (13*maxcycle) and may exit the loop with
-                                !> xyz/energy never updated
-        if (iterc(i) >= maxcycle_i) then
+        if (retry(i) > 60) then
           active(i) = .false.
           if (mycalc%anopt) then
             c = c+1
@@ -979,19 +995,15 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
           end if
           cycle
         end if
-        if (retry(i) > 12) then
-!>--- stuck: restart from the steepest descent direction with a full step
-          dirc(:,i) = -gnew
-          khist(i) = 0
-          retry(i) = 0
-          stepz(i) = 0.2_wp
-        end if
         stepz(i) = stepz(i)*0.25_wp
         gcand(:,i) = xacc(:,i)+stepz(i)*dirc(:,i)
         cycle
       end if
 
-!>--- accept the step and update the L-BFGS history
+!>--- accept the step: ONE L-BFGS cycle
+      iterc(i) = iterc(i)+1
+
+!>--- update the L-BFGS history
       xnew(:,i) = gcand(:,i)-xacc(:,i)
       ss = dot_product(gnew-gacc(:,i),xnew(:,i))
       if (abs(ss) > 1.0d-30) then
@@ -1008,8 +1020,8 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
         OPT(i)%rho(khist(i)) = 1.0_wp/ss
       end if
       xacc(:,i) = gcand(:,i)
+      gacc(:,i) = gnew
       eacc(i) = benergies(p)
-      pending(i) = .false.
 
 !>--- convergence bookkeeping (identical criteria to lbfgs_module)
       econv = abs(deltaE) .lt. ethr
@@ -1033,6 +1045,7 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
           call calc_eprint(calculations(1),eacc(i),calculations(1)%etmp,gnorm,ich2)
         end if
       else if (iterc(i) >= maxcycle_i) then
+!>--- cycle budget exhausted: keep the best (last accepted) point
         active(i) = .false.
         if (mycalc%anopt) then
           c = c+1
@@ -1041,6 +1054,36 @@ subroutine mlip_batch_oloop(env,mycalc,calculations,nall,structures,dump,ich,ich
         else
           structures(i)%energy = 1.0_wp
         end if
+      else
+!>--- not done: the gradient of the accepted trial point is the gradient
+!>--- of the new current point, so compute the next direction immediately
+!>--- and keep a pending trial (one batch call per cycle, like the
+!>--- standard line-searching L-BFGS)
+        if (khist(i) == 0) then
+          dirc(:,i) = -gnew
+        else
+          yy = dot_product(OPT(i)%Y(1:nvarb,khist(i)),OPT(i)%Y(1:nvarb,khist(i)))
+          if (yy > 1.0d-30) then
+            gamm = dot_product(OPT(i)%S(1:nvarb,khist(i)),OPT(i)%Y(1:nvarb,khist(i)))/yy
+          else
+            gamm = 1.0_wp
+          end if
+          qtmp = gnew
+          do j = khist(i),1,-1
+            OPT(i)%alpha(j) = OPT(i)%rho(j)*dot_product(OPT(i)%S(1:nvarb,j),qtmp)
+            qtmp = qtmp-OPT(i)%alpha(j)*OPT(i)%Y(1:nvarb,j)
+          end do
+          xnew(:,i) = gamm*qtmp
+          do j = 1,khist(i)
+            xnew(:,i) = xnew(:,i)+OPT(i)%S(1:nvarb,j)*(OPT(i)%alpha(j)- &
+              & OPT(i)%rho(j)*dot_product(OPT(i)%Y(1:nvarb,j),xnew(:,i)))
+          end do
+          dirc(:,i) = -xnew(:,i)
+        end if
+        stepz(i) = 0.2_wp
+        retry(i) = 0
+        gcand(:,i) = xacc(:,i)+stepz(i)*dirc(:,i)
+        pending(i) = .true.
       end if
     end do
 
@@ -1206,6 +1249,10 @@ subroutine crest_oloop_struc(env,nall,structures,dump,customcalc,eread,silent)
     end do
     calculations(i)%pr_energies = .false.
   end do
+
+!>--- broadcast the shared libtorch handle into the per-thread copies so the
+!>--- OMP threads do not each lazy-load their own (leaking) model instance
+  call broadcast_libtorch_shared_handles(mycalc,T,calculations)
 
 !>--- printout directions and timer initialization
   pr = .false. !> stdout printout
@@ -2007,5 +2054,51 @@ subroutine parallel_md_finish_printout(MD,vz,io,profiler)
   !$omp end critical
 
 end subroutine parallel_md_finish_printout
+!========================================================================================!
+!========================================================================================!
+!> Broadcast a shared libtorch model handle into the per-thread calcdata copies.
+!>
+!> calculation_settings_copy() deliberately nulls the opaque C++ model handle
+!> ("each fresh copy re-initialises lazily on first engrad()"). Without an
+!> explicit broadcast every OMP thread of the per-thread path loads its OWN
+!> full model instance on its first E+G call (c_libtorch_load -> torch::jit::
+!> load -> weights moved to GPU), and those thread-local contexts are dropped
+!> (not freed) when the parallel region ends: one full GPU model copy (~0.5 GiB
+!> for MACE-OMOL-extra-large) leaks per active thread per loop call.
+!>
+!> Multi-level (hybrid) calculations always use the per-thread path, so a
+!> TTConf run with a libtorch level performs one such leak per sweep block /
+!> optimization - enough zombie model copies to fill a 40+ GiB GPU mid-sweep
+!> and OOM every subsequent forward pass (empty ensemble, rc=155).
+!>
+!> Fix: for GPU libtorch levels, load the (registry-shared) model once before
+!> the OMP region and broadcast the handle into all thread copies. All forward
+!> passes are serialized by the C++ forward_mutex anyway, so one shared model
+!> is the only sensible configuration (see mlip_needs_shared_model).
+!========================================================================================!
+subroutine broadcast_libtorch_shared_handles(mycalc,T,calculations)
+  use crest_parameters,only:stdout
+  use crest_calculator
+  use calc_libtorch,only:libtorch_init_shared
+  implicit none
+  type(calcdata),intent(inout) :: mycalc
+  integer,intent(in) :: T
+  type(calcdata),intent(inout) :: calculations(T)
+  integer :: i,j,io
+  do j = 1,mycalc%ncalculations
+    if (mycalc%calcs(j)%id == jobtype%libtorch .and. &
+        mycalc%calcs(j)%libtorch_device_id > 0) then
+      io = 0
+      call libtorch_init_shared(mycalc%calcs(j),io)
+      if (io == 0) then
+        do i = 1,T
+          calculations(i)%calcs(j)%libtorch_handle = &
+            & mycalc%calcs(j)%libtorch_handle
+          calculations(i)%calcs(j)%libtorch_is_shared = .true.
+        end do
+      end if
+    end if
+  end do
+end subroutine broadcast_libtorch_shared_handles
 !========================================================================================!
 !========================================================================================!
