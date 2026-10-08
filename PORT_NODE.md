@@ -312,6 +312,23 @@ When enabled, Meson adds C++17 support, resolves the Torch dependency through CM
 
 The Fortran wrapper is compiled even when LibTorch is disabled. In that case, it provides stub implementations and does not require the C++ backend to be linked.
 
+### 7.3 Validation Environment
+
+The native LibTorch backend was built using the following software environment:
+
+| Component | Version |
+|---|---|
+| Linux | RHEL 9 |
+| GNU Fortran | 15.1.0 |
+| GCC | 9.5.0 |
+| GNU Make | 4.4.1 |
+| CMake | 3.29.3 |
+| LibTorch | 2.7.0+cu126 |
+| CUDA | 12.6 |
+| GNU C Library | 2.17 |
+
+GPU performance and multi-GPU scaling have yet to be benchmarked systematically.
+
 ## 8. Running Calculations
 
 ### 8.1 Ensemble singlepoints
