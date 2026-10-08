@@ -1,3 +1,109 @@
+## Acknowledgements
+
+This work builds on [CREST](https://github.com/crest-lab/crest) and the native LibTorch MLIP implementation developed in [EPiCs-group/crest-mlip](https://github.com/EPiCs-group/crest-mlip). It is distributed under the GNU Lesser General Public License, version 3 or later (LGPL-3.0-or-later).
+
+The original MLIP backend provided the basis for the TorchScript interface and batched inference routines. These components were ported and adapted to CREST 3.1 and ensemble infrastructure, with additional work on batched geometry optimisation.
+
+The original copyright notices have been retained. Modifications made for CREST 3.1 compatibility and batched geometry optimisation are documented separately. See [Port Notes](./PORT_NOTES.md) for implementation details.
+
+I thank the developers and contributors of both projects for making their work publicly available.
+
+## Quick Start
+
+This example builds CREST with the native LibTorch backend and runs a singlepoint calculation using a TorchScript MACE model.
+
+### 1 Requirements
+
+You need:
+
+- A C++17-compatible compiler and a Fortran compiler.
+- CMake and the standard CREST build dependencies.
+- PyTorch with LibTorch CMake files.
+- A compatible TorchScript `.pt` model.
+- CUDA and a supported GPU for GPU inference.
+
+The commands below assume PyTorch is already installed in the active environment and the CREST source is in `./crest`.
+
+### 2 Build
+
+```bash
+# Locate the LibTorch CMake package
+export TORCH_PREFIX=$(python3 -c \
+  'import torch; print(torch.utils.cmake_prefix_path)')
+
+# Configure
+cmake -S ./crest -B ./build \
+  -DWITH_LIBTORCH=ON \
+  -DCMAKE_PREFIX_PATH="$TORCH_PREFIX" \
+  -DCMAKE_BUILD_TYPE=Release
+
+# Compile
+cmake --build ./build --parallel $(nproc)
+```
+
+### 3 Prepare a input
+
+Create `run.toml`:
+
+```toml
+runtype = "ttconf"
+input = "structure.xyz"
+
+[ttconf]
+preset = "normal"
+sp = true
+
+[calculation]
+
+[[calculation.level]]
+method = "libtorch"
+model_path = "/path/to/model.pt"
+model_format = "mace-lammps"
+device = "cuda:0"
+```
+
+Replace `model_path` with the path to an exported MACE-LAMMPS-compatible model.
+
+With `sp = true`, TTConf evaluates candidate conformers through the batched singlepoint path when its conditions are met.
+
+Set `sp = false` to use geometry optimisation, which can select the batched L-BFGS driver on a compatible GPU configuration.
+
+`structure.xyz` must contain one or more standard XYZ frames. For batched execution, all frames must have the same atom count and atomic-number order.
+
+### 4 Run
+
+```bash
+./build/crest --input run.toml
+```
+
+The executable path may differ depending on the build layout.
+
+For a CPU-only check, change:
+
+```toml
+device = "cpu"
+
+[calculation]
+libtorch_batch_opt = true
+```
+
+Place `libtorch_batch_opt = true` in the existing `[calculation]` table, before `[[calculation.level]]`.
+
+### 5 Check the result
+
+Confirm that:
+
+1. CREST accepts the `libtorch` calculation method.
+2. The TorchScript model loads without an error.
+3. The calculation returns finite energies.
+4. The batched path is selected for a compatible GPU ensemble.
+
+Set `libtorch_debug = true` under `[[calculation.level]]` to obtain additional inference timing information.
+
+If CUDA memory is insufficient, reduce `batch_size` manually.
+
+------
+
 <h1 align="center">CREST</h1>
 <h3 align="center">Conformer-Rotamer Ensemble Sampling Tool</h3>
 <div align="center">
